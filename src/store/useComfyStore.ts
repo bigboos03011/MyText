@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import { initialHistory, insightMetrics, promptFragments, qualityHighlights, workflowTemplates } from '@/data/mockData'
-import { buildComfyPayload, createTaskId } from '@/utils/comfyui'
+import { buildComfyPayload, buildViewUrl, buildWsEndpoint, createTaskId, fetchJson, normalizeEndpoint } from '@/utils/comfyui'
 import type { ConnectionSettings, GeneratedAsset, GenerationForm, InsightMetric, QueueTask, ThemeMode, WorkflowTemplate } from '@/types/comfyui'
 
 type ComfyState = {
@@ -25,19 +25,19 @@ type ComfyState = {
   updateForm: <K extends keyof GenerationForm>(field: K, value: GenerationForm[K]) => void
   appendPromptFragment: (fragment: string) => void
   toggleFavoriteWorkflow: (workflowId: string) => void
-  submitTask: () => void
+  submitTask: () => Promise<void>
   toggleFavoriteAsset: (assetId: string) => void
   selectAsset: (assetId: string) => void
   reuseHistoryAsset: (assetId: string) => void
   updateConnection: (payload: Partial<ConnectionSettings>) => void
-  testConnection: () => void
+  testConnection: () => Promise<void>
   setConfigOpen: (open: boolean) => void
   toggleTheme: () => void
 }
 
 const defaultConnection: ConnectionSettings = {
-  endpoint: 'http://127.0.0.1:8188',
-  websocket: 'ws://127.0.0.1:8188/ws',
+  endpoint: 'http://127.0.0.1:8187',
+  websocket: 'ws://127.0.0.1:8187/ws',
   autoReconnect: true,
   envLabel: '本地 ComfyUI',
 }
@@ -46,6 +46,45 @@ const getWorkflowById = (workflowId: string) =>
   workflowTemplates.find((item) => item.id === workflowId) ?? workflowTemplates[0]
 
 const getInitialForm = () => getWorkflowById(workflowTemplates[0].id).defaultForm
+
+type ComfyPromptResponse = {
+  prompt_id: string
+}
+
+type ComfyHistoryItem = {
+  outputs?: Record<
+    string,
+    {
+      images?: Array<{
+        filename: string
+        subfolder?: string
+        type?: string
+      }>
+    }
+  >
+}
+
+const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms))
+
+async function pollHistoryForImages(endpoint: string, promptId: string, maxAttempts = 24) {
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const history = await fetchJson<Record<string, ComfyHistoryItem>>(
+      `${normalizeEndpoint(endpoint)}/history/${promptId}`
+    )
+    const item = history[promptId]
+
+    if (item?.outputs) {
+      const images = Object.values(item.outputs).flatMap((output) => output.images ?? [])
+      if (images.length > 0) {
+        return images
+      }
+    }
+
+    await sleep(1500)
+  }
+
+  return []
+}
 
 export const useComfyStore = create<ComfyState>()(
   persist(
@@ -112,11 +151,31 @@ export const useComfyStore = create<ComfyState>()(
             ? state.favoriteWorkflowIds.filter((id) => id !== workflowId)
             : [...state.favoriteWorkflowIds, workflowId],
         })),
-      submitTask: () => {
+      submitTask: async () => {
         const state = get()
         const workflow = getWorkflowById(state.activeWorkflowId)
-        const payload = buildComfyPayload(workflow, state.form)
         const id = createTaskId()
+        const endpoint = normalizeEndpoint(state.connection.endpoint)
+
+        if (!state.form.prompt.trim()) {
+          set({
+            isSubmitting: false,
+            connectionMessage: '请先填写提示词后再提交。',
+          })
+          return
+        }
+
+        if (!workflow.apiPromptTemplate || !workflow.fieldMappings?.length) {
+          set({
+            isSubmitting: false,
+            isConnected: false,
+            connectionMessage: '当前前端还没有接入这份工作流的 API 模板，请提供完整工作流 JSON 或 API JSON。',
+          })
+          return
+        }
+
+        const payload = buildComfyPayload(workflow, state.form)
+
         const nextTask: QueueTask = {
           id,
           workflowId: workflow.id,
@@ -125,7 +184,7 @@ export const useComfyStore = create<ComfyState>()(
           progress: 12,
           eta: '已进入队列',
           startedAt: '刚刚',
-          promptPreview: String(payload.prompt.positive).slice(0, 28),
+          promptPreview: state.form.prompt.slice(0, 28),
           previewImages: workflow.gallery.slice(0, Math.max(1, state.form.batchSize)),
           results: [],
         }
@@ -136,23 +195,39 @@ export const useComfyStore = create<ComfyState>()(
           selectedAssetId: current.selectedAssetId,
         }))
 
-        window.setTimeout(() => {
+        try {
+          const response = await fetchJson<ComfyPromptResponse>(`${endpoint}/prompt`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(payload),
+          })
+
           set((current) => ({
             queue: current.queue.map((task) =>
               task.id === id
-                ? { ...task, status: 'running', progress: 57, eta: '预计 00:21' }
+                ? { ...task, id: response.prompt_id, status: 'running', progress: 55, eta: 'ComfyUI 执行中' }
                 : task
             ),
+            connectionMessage: '任务已提交到 ComfyUI。',
           }))
-        }, 900)
 
-        window.setTimeout(() => {
-          const outputImage = workflow.gallery[(state.history.length + workflow.gallery.length) % workflow.gallery.length]
+          const images = await pollHistoryForImages(endpoint, response.prompt_id)
+
+          if (!images.length) {
+            throw new Error('未在历史记录中获取到输出图片')
+          }
+
+          const resultUrls = images.map((image) =>
+            buildViewUrl(endpoint, image.filename, image.subfolder ?? '', image.type ?? 'output')
+          )
+
           const createdAsset: GeneratedAsset = {
             id: `asset-${Date.now()}`,
             workflowId: workflow.id,
             workflowName: workflow.name,
-            imageUrl: outputImage,
+            imageUrl: resultUrls[0],
             prompt: state.form.prompt,
             createdAt: '刚刚生成',
             favorite: false,
@@ -163,21 +238,41 @@ export const useComfyStore = create<ComfyState>()(
 
           set((current) => ({
             queue: current.queue.map((task) =>
-              task.id === id
+              task.id === response.prompt_id
                 ? {
                     ...task,
                     status: 'success',
                     progress: 100,
                     eta: '生成完成',
-                    results: [outputImage],
+                    results: resultUrls,
                   }
                 : task
             ),
             history: [createdAsset, ...current.history],
             selectedAssetId: createdAsset.id,
             isSubmitting: false,
+            isConnected: true,
+            connectionMessage: '生成完成，结果已写入历史记录。',
           }))
-        }, 2200)
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : '未知错误'
+          set((current) => ({
+            queue: current.queue.map((task) =>
+              task.id === id
+                ? {
+                    ...task,
+                    status: 'error',
+                    progress: 0,
+                    eta: '提交失败',
+                    errorMessage,
+                  }
+                : task
+            ),
+            isSubmitting: false,
+            isConnected: false,
+            connectionMessage: `提交失败：${errorMessage}`,
+          }))
+        }
       },
       toggleFavoriteAsset: (assetId) =>
         set((state) => ({
@@ -206,21 +301,40 @@ export const useComfyStore = create<ComfyState>()(
         }))
       },
       updateConnection: (payload) =>
-        set((state) => ({
-          connection: {
+        set((state) => {
+          const nextConnection = {
             ...state.connection,
             ...payload,
-          },
-        })),
-      testConnection: () => {
-        const endpoint = get().connection.endpoint
-        const isValid = endpoint.startsWith('http')
-        set({
-          isConnected: isValid,
-          connectionMessage: isValid
-            ? '连接检测成功，ComfyUI API 可用。'
-            : '地址格式不正确，请检查 ComfyUI 服务地址。',
-        })
+          }
+
+          if (payload.endpoint) {
+            nextConnection.websocket = buildWsEndpoint(payload.endpoint)
+          }
+
+          return {
+            connection: nextConnection,
+          }
+        }),
+      testConnection: async () => {
+        const endpoint = normalizeEndpoint(get().connection.endpoint)
+        try {
+          await fetchJson<Record<string, unknown>>(`${endpoint}/history`)
+          set((state) => ({
+            isConnected: true,
+            connectionMessage: '连接检测成功，ComfyUI API 可用。',
+            connection: {
+              ...state.connection,
+              endpoint,
+              websocket: buildWsEndpoint(endpoint),
+            },
+          }))
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : '未知错误'
+          set({
+            isConnected: false,
+            connectionMessage: `连接失败：${errorMessage}`,
+          })
+        }
       },
       setConfigOpen: (open) => set({ isConfigOpen: open }),
       toggleTheme: () =>

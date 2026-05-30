@@ -26,6 +26,12 @@ export type WorkflowTemplate = {
   nodeSummary: string[]
   qualityScore: string
   defaultForm: GenerationForm
+  apiPromptTemplate?: Record<string, unknown>
+  fieldMappings?: Array<{
+    field: keyof GenerationForm | 'prompt' | 'negativePrompt'
+    nodeId: string
+    inputKey: string
+  }>
 }
 
 export type GeneratedAsset = {
